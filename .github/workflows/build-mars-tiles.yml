@@ -1,0 +1,120 @@
+name: Build Mars tiles
+
+# Builds self-hosted Mars terrain + color tiles from free NASA/USGS data and
+# uploads them to Cloudflare R2 (bucket auridei-tiles, served at
+# https://tiles.auridei.com/mars/). Run it from the Actions tab → "Run workflow".
+#
+# Needs three repository secrets: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY.
+
+on:
+  workflow_dispatch:
+    inputs:
+      part:
+        description: "What to build"
+        type: choice
+        options: [both, imagery, terrain]
+        default: both
+      max_zoom:
+        description: "Deepest zoom level (8 = full detail)"
+        default: "8"
+
+env:
+  BUCKET: auridei-tiles
+  BODY: mars
+  RCLONE_CONFIG_R2_TYPE: s3
+  RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+  RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  RCLONE_CONFIG_R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+  RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+
+jobs:
+  imagery:
+    if: ${{ inputs.part == 'both' || inputs.part == 'imagery' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: bash scripts/prepare_workdir.sh
+      - name: Install tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q gdal-bin python3-gdal aria2 rclone
+          rclone version | head -1
+      - name: Check R2 access
+        run: rclone lsf r2:$BUCKET --max-depth 1 || (echo "::error::Can't reach the R2 bucket. Check the three R2 secrets and that the bucket name is $BUCKET." && exit 1)
+      - name: Download Viking color mosaic (~12 GB)
+        working-directory: ${{ env.WORK }}
+        run: |
+          aria2c -x 8 -s 8 --max-tries=10 --retry-wait=10 -o color.tif \
+            "https://planetarymaps.usgs.gov/mosaic/Mars_Viking_MDIM21_ClrMosaic_global_232m.tif"
+          ls -lh color.tif
+      - name: Convert to a fast, tiled file
+        working-directory: ${{ env.WORK }}
+        run: |
+          gdal_translate -q -of GTiff -co TILED=YES -co COMPRESS=JPEG -co PHOTOMETRIC=YCBCR \
+            -co JPEG_QUALITY=92 -co BIGTIFF=YES --config GDAL_CACHEMAX 2048 color.tif color_tiled.tif
+          rm color.tif
+          gdaladdo -q -r average --config COMPRESS_OVERVIEW JPEG --config PHOTOMETRIC_OVERVIEW YCBCR \
+            color_tiled.tif 2 4 8 16 32 64 128 256
+          ls -lh; df -h .
+      - name: Cut color tiles
+        run: |
+          python3 scripts/tile_imagery.py "$WORK/color_tiled.tif" "$WORK/tiles/imagery" \
+            --max-zoom ${{ inputs.max_zoom }} --workers $(nproc)
+          echo "Tiles: $(find $WORK/tiles/imagery -type f | wc -l)   Size: $(du -sh $WORK/tiles/imagery | cut -f1)"
+      - name: Upload color tiles to R2
+        run: |
+          rclone copy "$WORK/tiles/imagery" r2:$BUCKET/$BODY/imagery \
+            --transfers 48 --checkers 48 --fast-list --stats 60s --stats-one-line
+          echo "Done: https://tiles.auridei.com/$BODY/imagery/0/0/0.jpg"
+
+  terrain:
+    if: ${{ inputs.part == 'both' || inputs.part == 'terrain' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: bash scripts/prepare_workdir.sh
+      - name: Install tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q gdal-bin python3-gdal aria2 rclone
+          docker pull tumgis/ctb-quantized-mesh
+      - name: Check R2 access
+        run: rclone lsf r2:$BUCKET --max-depth 1 || (echo "::error::Can't reach the R2 bucket. Check the three R2 secrets and that the bucket name is $BUCKET." && exit 1)
+      - name: Download MOLA/HRSC elevation (~11 GB)
+        working-directory: ${{ env.WORK }}
+        run: |
+          aria2c -x 8 -s 8 --max-tries=10 --retry-wait=10 -o dem.tif \
+            "https://planetarymaps.usgs.gov/mosaic/Mars/HRSC_MOLA_Blend/Mars_HRSC_MOLA_BlendDEM_Global_200mp_v2.tif"
+          ls -lh dem.tif
+      - name: Prepare elevation (lat/lon degrees, terrain resolution)
+        working-directory: ${{ env.WORK }}
+        run: |
+          # Zoom 8 terrain uses 65 x 2^9 samples around the planet.
+          W=$(( 65 * (1 << (${{ inputs.max_zoom }} + 1)) )); H=$(( W / 2 ))
+          gdal_translate -q -of GTiff -a_srs EPSG:4326 -a_ullr -180 90 180 -90 \
+            -outsize $W $H -r average -co TILED=YES -co COMPRESS=DEFLATE -co BIGTIFF=IF_SAFER \
+            --config GDAL_CACHEMAX 2048 dem.tif dem_4326.tif
+          rm dem.tif
+          gdalinfo dem_4326.tif | head -20
+      - name: Build terrain tiles
+        working-directory: ${{ env.WORK }}
+        run: |
+          mkdir -p tiles/terrain
+          docker run --rm -e GDAL_CACHEMAX=3072 -v "$PWD:/work" -w /work tumgis/ctb-quantized-mesh \
+            ctb-tile -f Mesh -C -N -s ${{ inputs.max_zoom }} -e 0 -o tiles/terrain dem_4326.tif
+          docker run --rm -v "$PWD:/work" -w /work tumgis/ctb-quantized-mesh \
+            ctb-tile -f Mesh -C -N -s ${{ inputs.max_zoom }} -e 0 -l -o tiles/terrain dem_4326.tif
+          sudo chown -R "$USER" tiles
+          python3 "$GITHUB_WORKSPACE/scripts/finish_terrain.py" tiles/terrain
+          echo "Tiles: $(find tiles/terrain -type f | wc -l)   Size: $(du -sh tiles/terrain | cut -f1)"
+          head -c 600 tiles/terrain/layer.json; echo
+      - name: Upload terrain tiles to R2
+        run: |
+          rclone copy "$WORK/tiles/terrain" r2:$BUCKET/$BODY/terrain \
+            --transfers 48 --checkers 48 --fast-list --stats 60s --stats-one-line
+          echo "Done: https://tiles.auridei.com/$BODY/terrain/layer.json"
