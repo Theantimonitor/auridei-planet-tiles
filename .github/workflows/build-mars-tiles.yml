@@ -29,6 +29,8 @@ env:
   RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
   RCLONE_CONFIG_R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
   RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+  RCLONE_CONFIG_R2_REGION: auto
+  RCLONE_CONFIG_R2_ACL: private
 
 jobs:
   imagery:
@@ -187,10 +189,27 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q gdal-bin python3-gdal aria2 rclone
+          sudo apt-get install -y -q gdal-bin python3-gdal aria2
+          curl -fsSL https://rclone.org/install.sh | sudo bash || sudo apt-get install -y -q rclone
           rclone version | head -1
       - name: Check R2 access
-        run: rclone lsf r2:$BUCKET --max-depth 1 || (echo "::error::Can't reach the R2 bucket. Check the three R2 secrets and that the bucket name is $BUCKET." && exit 1)
+        env:
+          ACC: ${{ secrets.R2_ACCOUNT_ID }}
+          KID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          SEC: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          # Lengths only (never the values): Account ID 32, Access Key ID 32, Secret 64.
+          echo "R2_ACCOUNT_ID length: ${#ACC}  (should be 32)"
+          echo "R2_ACCESS_KEY_ID length: ${#KID}  (should be 32)"
+          echo "R2_SECRET_ACCESS_KEY length: ${#SEC}  (should be 64)"
+          [ ${#ACC} -eq 32 ] || echo "::error::R2_ACCOUNT_ID looks wrong (length ${#ACC}, expected 32). Re-paste it in Settings > Secrets."
+          [ ${#KID} -eq 32 ] || echo "::error::R2_ACCESS_KEY_ID looks wrong (length ${#KID}, expected 32). Re-paste it."
+          [ ${#SEC} -eq 64 ] || echo "::error::R2_SECRET_ACCESS_KEY looks wrong (length ${#SEC}, expected 64). Re-paste it."
+          echo "test" > /tmp/auridei-check.txt
+          if rclone copyto /tmp/auridei-check.txt r2:$BUCKET/_check/github.txt -vv 2>&1 | tail -25; then :; fi
+          rclone lsf r2:$BUCKET/_check/ -vv 2>&1 | tail -25
+          rclone lsf r2:$BUCKET/_check/ | grep -q github.txt || (echo "::error::Can't write to the R2 bucket $BUCKET - see the log lines above for the reason." && exit 1)
+          echo "R2 access OK"
       - name: Download Viking color mosaic (~12 GB)
         working-directory: ${{ env.WORK }}
         run: |
@@ -373,10 +392,27 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q gdal-bin python3-gdal aria2 rclone
+          sudo apt-get install -y -q gdal-bin python3-gdal aria2
+          curl -fsSL https://rclone.org/install.sh | sudo bash || sudo apt-get install -y -q rclone
           docker pull tumgis/ctb-quantized-mesh
       - name: Check R2 access
-        run: rclone lsf r2:$BUCKET --max-depth 1 || (echo "::error::Can't reach the R2 bucket. Check the three R2 secrets and that the bucket name is $BUCKET." && exit 1)
+        env:
+          ACC: ${{ secrets.R2_ACCOUNT_ID }}
+          KID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          SEC: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          # Lengths only (never the values): Account ID 32, Access Key ID 32, Secret 64.
+          echo "R2_ACCOUNT_ID length: ${#ACC}  (should be 32)"
+          echo "R2_ACCESS_KEY_ID length: ${#KID}  (should be 32)"
+          echo "R2_SECRET_ACCESS_KEY length: ${#SEC}  (should be 64)"
+          [ ${#ACC} -eq 32 ] || echo "::error::R2_ACCOUNT_ID looks wrong (length ${#ACC}, expected 32). Re-paste it in Settings > Secrets."
+          [ ${#KID} -eq 32 ] || echo "::error::R2_ACCESS_KEY_ID looks wrong (length ${#KID}, expected 32). Re-paste it."
+          [ ${#SEC} -eq 64 ] || echo "::error::R2_SECRET_ACCESS_KEY looks wrong (length ${#SEC}, expected 64). Re-paste it."
+          echo "test" > /tmp/auridei-check.txt
+          if rclone copyto /tmp/auridei-check.txt r2:$BUCKET/_check/github.txt -vv 2>&1 | tail -25; then :; fi
+          rclone lsf r2:$BUCKET/_check/ -vv 2>&1 | tail -25
+          rclone lsf r2:$BUCKET/_check/ | grep -q github.txt || (echo "::error::Can't write to the R2 bucket $BUCKET - see the log lines above for the reason." && exit 1)
+          echo "R2 access OK"
       - name: Download MOLA/HRSC elevation (~11 GB)
         working-directory: ${{ env.WORK }}
         run: |
